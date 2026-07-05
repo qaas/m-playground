@@ -1,0 +1,181 @@
+let
+    // Combines every registered source. tblSourceRegistry[System_Name] returns the column
+    // as a plain list (e.g. {"SystemA", "SystemB"}); fnCleanSource handles the rest.
+    Combined = Table.Combine(List.Transform(tblSourceRegistry[System_Name], each fnCleanSource(_))),
+
+    // Restricts and orders columns to the canonical field list, read directly from Field
+    // Mapping rather than hardcoded -- adding or removing a canonical field requires only
+    // a Field Mapping edit.
+    ReorderList = List.Combine({{"Source_System"}, tblFieldMapping[Canonical_Field]}),
+    Reordered = Table.SelectColumns(Combined, ReorderList),
+
+    // Translates raw values to canonical values for whichever fields Field Mapping's
+    // Value_Mapping_Table column designates (most fields require no translation and are
+    // skipped). Each field keeps the same name before and after translation -- e.g. the
+    // field is always "Status", never "Status_Raw" beforehand -- which requires producing
+    // the translated value under a temporary name, removing the untranslated original, and
+    // renaming the temporary column back, since Power Query does not allow two columns
+    // with the same name to coexist mid-query. The mapping table itself is resolved by
+    // name at runtime via Excel.CurrentWorkbook, making the translation step fully
+    // data-driven rather than requiring one hardcoded merge per field.
+    //
+    // HARDCODED: "Value_Mapping_Table" as Field Mapping's own column name; "Source_System"
+    // and "Raw_Value" as the join-key column names every Mapping_Values table must use;
+    // "Canonical_Value" as the translated-value column name every Mapping_Values table
+    // must use; the "_Translated" temporary-name suffix (only visible mid-query, never in
+    // the final output).
+    FieldsNeedingTranslation = Table.SelectRows(tblFieldMapping, each [Value_Mapping_Table] <> null and [Value_Mapping_Table] <> ""),
+    ValueMapped = List.Accumulate(
+        Table.ToRecords(FieldsNeedingTranslation),
+        Reordered,
+        (state, cfg) =>
+            let
+                fieldName = cfg[Canonical_Field],
+                tempName  = fieldName & "_Translated",
+                mapTable  = Excel.CurrentWorkbook(){[Name=cfg[Value_Mapping_Table]]}[Content],
+                joined    = Table.NestedJoin(state, {"Source_System", fieldName}, mapTable,
+                                {"Source_System", "Raw_Value"}, "JoinTemp", JoinKind.LeftOuter),
+                expanded  = Table.ExpandTableColumn(joined, "JoinTemp", {"Canonical_Value"}, {tempName}),
+                dropped   = Table.RemoveColumns(expanded, {fieldName}),
+                renamed   = Table.RenameColumns(dropped, {{tempName, fieldName}})
+            in
+                renamed
+    ),
+
+    // Risk_ID is a composite key (Source_System + Source_ID), not a copy of Source_ID.
+    // Source_ID alone is only guaranteed unique WITHIN one source system, not across all
+    // of them -- if two source systems ever produced the same raw ID under a different
+    // convention, Source_ID collisions would corrupt the Review_Log lookup below, silently
+    // attaching one item's review decision to a different item. The composite key removes
+    // that dependency on every source's ID convention staying distinct forever.
+    //
+    // HARDCODED: "-" as the separator between Source_System and Source_ID. Changing this
+    // format would invalidate every existing Risk_ID already recorded in Review_Log --
+    // avoid changing it once any review history exists.
+    AddRiskID = Table.AddColumn(ValueMapped, "Risk_ID", each [Source_System] & "-" & [Source_ID]),
+
+    // The formulas below define specific business rules (what "overdue" means, what counts
+    // as a "potential duplicate") rather than performing a generic transformation, so field
+    // names are intentionally hardcoded here rather than data-driven. Making these rules
+    // configurable would require a general rule-evaluation engine for marginal benefit, and
+    // would make the underlying logic harder to inspect and audit.
+    //
+    // HARDCODED: "Closed" as the Status value meaning an item is no longer active (used
+    // throughout this query, not just here); "Due_Date" as the field driving the overdue
+    // calculation.
+    AddDaysOverdue = Table.AddColumn(AddRiskID, "Days_Overdue", each
+        if [Status] = "Closed" or [Due_Date] = null then 0
+        else List.Max({0, Duration.Days(DateTime.LocalNow() - [Due_Date])})),
+    AddIsOverdue = Table.AddColumn(AddDaysOverdue, "Is_Overdue", each if [Days_Overdue] > 0 then "Yes" else "No"),
+
+    // Duplicate detection is based on matching the first N characters of Title (trimmed
+    // and upper-cased so whitespace and casing differences don't defeat the match), rather
+    // than matching on Category. Text-prefix matching produces fewer false positives at
+    // the cost of missing duplicates worded differently after the prefix.
+    //
+    // HARDCODED: "Title" as the field compared; "Prefix_Length" as tblDedupConfig's own
+    // column name. N itself is NOT hardcoded -- it is read from tblDedupConfig, so
+    // sensitivity can be retuned by editing that one value and refreshing, with no code change.
+    PrefixLength = tblDedupConfig{0}[Prefix_Length],
+    AddSignature = Table.AddColumn(AddIsOverdue, "Signature", each
+        Text.Start(Text.Trim(Text.Upper([Title])), PrefixLength)),
+
+    // Resolves each item's region via a merge against Country_Region_Map (rather than a
+    // per-row table scan, which keeps this performant on a large register). Global-scope
+    // items and items with no country get no region bucket, since they apply everywhere
+    // rather than to a specific area. A country absent from Country_Region_Map produces a
+    // visible "Unknown Region: <country>" value rather than failing silently.
+    //
+    // HARDCODED: "Global" as the Scope value meaning an item applies everywhere;
+    // "Region_Country" as the field holding an item's country; "Country" and
+    // "Region_Bucket" as Country_Region_Map's own column names; the literal text
+    // "Unknown Region: " prefixing an unmapped country.
+    MergeCountryBucket = Table.NestedJoin(AddSignature, {"Region_Country"}, tblCountryRegionMap,
+        {"Country"}, "CountryJoin", JoinKind.LeftOuter),
+    ExpandCountryBucket = Table.ExpandTableColumn(MergeCountryBucket, "CountryJoin", {"Region_Bucket"}, {"Region_Bucket_Raw"}),
+    AddRegionBucket = Table.AddColumn(ExpandCountryBucket, "Region_Bucket", each
+        if [Scope] = "Global" or [Region_Country] = null or [Region_Country] = "" then null
+        else if [Region_Bucket_Raw] <> null then [Region_Bucket_Raw]
+        else "Unknown Region: " & [Region_Country]),
+    DropRawBucket = Table.RemoveColumns(AddRegionBucket, {"Region_Bucket_Raw"}),
+
+    // Clusters items sharing a Signature among currently open items only -- a closed item
+    // is excluded from consideration and does not contribute to any other item's cluster
+    // size. Table.Group combined with List.Distinct produces an exact distinct count of
+    // regions and countries per cluster in a single pass.
+    OpenForClustering = Table.SelectRows(DropRawBucket, each [Status] <> "Closed"),
+    ClusterStats = Table.Group(OpenForClustering, {"Signature"}, {
+        {"ClusterSize", each Table.RowCount(_), Int64.Type},
+        {"HasGlobal", each List.Contains(_[Scope], "Global"), type logical},
+        {"BucketCount", each List.Count(List.Distinct(List.RemoveNulls(_[Region_Bucket]))), Int64.Type},
+        {"CountryCount", each List.Count(List.Distinct(List.RemoveNulls(_[Region_Country]))), Int64.Type}
+    }),
+
+    // Classifies each cluster's scope level:
+    //   1) any member is Global-scope                          -> Global
+    //   2) members span more than one region bucket             -> Global
+    //   3) members span more than one country within one bucket -> Regional
+    //   4) members share a single country                       -> Local
+    //
+    // HARDCODED: the four output values "Global"/"Regional"/"Local"/null, and the order in
+    // which the four conditions are evaluated (order matters -- rule 1 takes priority over
+    // rule 2, and so on).
+    AddSuggestion = Table.AddColumn(ClusterStats, "Suggested_Scope_Level", each
+        if [ClusterSize] <= 1 then null
+        else if [HasGlobal] then "Global"
+        else if [BucketCount] > 1 then "Global"
+        else if [CountryCount] > 1 then "Regional"
+        else "Local"),
+    ClusterLookup = Table.SelectColumns(AddSuggestion, {"Signature", "ClusterSize", "Suggested_Scope_Level"}),
+
+    // Applies cluster-level results to every row, including closed items, which are then
+    // explicitly reset to "No"/null below regardless of whether they share a signature
+    // with an open cluster -- a closed item is out of scope for duplicate review.
+    MergeCluster = Table.NestedJoin(DropRawBucket, {"Signature"}, ClusterLookup, {"Signature"}, "ClusterJoin", JoinKind.LeftOuter),
+    ExpandCluster = Table.ExpandTableColumn(MergeCluster, "ClusterJoin", {"ClusterSize", "Suggested_Scope_Level"}, {"ClusterSize", "Suggested_Scope_Level"}),
+
+    AddIsPotentialDup = Table.AddColumn(ExpandCluster, "Is_Potential_Duplicate", each
+        if [Status] = "Closed" or [ClusterSize] = null or [ClusterSize] <= 1 then "No" else "Yes"),
+    FixScopeForClosed = Table.AddColumn(AddIsPotentialDup, "Suggested_Scope_Level_Final", each
+        if [Status] = "Closed" then null else [Suggested_Scope_Level]),
+    DropIntermediate = Table.RemoveColumns(FixScopeForClosed, {"ClusterSize", "Suggested_Scope_Level"}),
+    RenameScope = Table.RenameColumns(DropIntermediate, {{"Suggested_Scope_Level_Final", "Suggested_Scope_Level"}}),
+
+    // Brings in manually recorded review decisions, keyed by Risk_ID. Review_Log is kept
+    // as a separate table specifically because a refresh rebuilds this query's output from
+    // scratch; any value entered directly into this query's result would be lost on the
+    // next refresh.
+    //
+    // HARDCODED: "Risk_ID" as the join key -- must exist, spelled exactly this way, as a
+    // column on the Review_Log sheet; "Review_Status" and "Reviewed_Scope_Level" as the
+    // two Review_Log column names actually pulled into Canonical (Review_Log's other
+    // columns -- Description, Reviewed_By, Review_Date, Notes -- stay in Review_Log only
+    // and are not referenced here).
+    MergeReview = Table.NestedJoin(RenameScope, {"Risk_ID"}, tblReviewLog, {"Risk_ID"}, "ReviewJoin", JoinKind.LeftOuter),
+    ExpandReview = Table.ExpandTableColumn(MergeReview, "ReviewJoin",
+        {"Review_Status", "Reviewed_Scope_Level"}, {"Review_Status", "Reviewed_Scope_Level"}),
+
+    // Defines the final output schema. The 12 raw/passthrough fields are read directly from
+    // Field Mapping -- adding a canonical field there now flows through to the output
+    // automatically, with no risk of it being silently dropped at this step.
+    //
+    // HARDCODED: "Risk_ID" and "Source_System" (computed above, not present in Field
+    // Mapping); the eight computed-field names below (Days_Overdue, Is_Overdue, Signature,
+    // Region_Bucket, Is_Potential_Duplicate, Suggested_Scope_Level, Review_Status,
+    // Reviewed_Scope_Level) -- none of these exist in Field Mapping, so they cannot be
+    // derived and must be listed explicitly. Adding a new field that is itself computed
+    // within this query (rather than sourced from a source system) requires adding its
+    // name to this list -- Table.SelectColumns raises an immediate, clear error if any
+    // name in this list does not exist at this point, which is the safeguard for typos
+    // in this list or an upstream step silently failing to produce an expected column.
+    FinalOrder = Table.SelectColumns(
+        ExpandReview,
+        List.Combine({
+            {"Risk_ID", "Source_System"},
+            tblFieldMapping[Canonical_Field],
+            {"Days_Overdue", "Is_Overdue", "Signature", "Region_Bucket",
+             "Is_Potential_Duplicate", "Suggested_Scope_Level", "Review_Status", "Reviewed_Scope_Level"}
+        })
+    )
+in
+    FinalOrder
