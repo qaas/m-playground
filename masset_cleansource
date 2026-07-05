@@ -1,0 +1,62 @@
+// ============================================================================
+// fnCleanSource
+// ----------------------------------------------------------------------------
+// Cleans and normalizes a single source system's raw export: renames columns to their
+// canonical names, applies date typing, and tags each row with its source system.
+// Called once per source (see tblCanonical's Combined step) and requires no changes when
+// a source is added, removed, or has its raw columns renamed or reordered.
+//
+// Parameter:
+//   systemName -- a single label (e.g. "SystemA"). A naming convention ties this one value
+//     to everything the function needs, rather than requiring three separate lookups:
+//       1. It matches a column header in Field Mapping (tblFieldMapping), identifying which
+//          column holds this source's raw header names.
+//       2. It matches a row in Source_Registry, which is how this function gets invoked.
+//       3. With "tbl" prefixed, it matches the Excel Table holding the raw export itself
+//          (e.g. systemName "SystemA" resolves to table "tblSystemA").
+//
+// Onboarding a new source requires exactly three additions, and no code changes:
+//   - a new column in Field Mapping, named after the source, populated per canonical field
+//   - a new row in Source_Registry containing that same name
+//   - an Excel Table named "tbl" + that same name, holding the raw export
+//
+// HARDCODED IN THIS FUNCTION (change here if these conventions ever change):
+//   - "tbl" as the raw-table name prefix (tableName step)
+//   - "N/A - Not in Source" as the marker meaning a field does not apply to a given source
+//     (Applicable step) -- must match the marker used in Field Mapping exactly
+//   - "Canonical_Field" and "Data_Type" as Field Mapping's own column names (RenamePairs,
+//     DateFieldCandidates steps)
+//   - "Date" as the Data_Type value that triggers date typing (DateFieldCandidates step)
+//   - "Source_System" as the name of the column that records which source a row came from
+//     (AddSystem step) -- referenced again throughout tblCanonical
+// ============================================================================
+(systemName as text) as table =>
+let
+    // Resolves the raw data table purely from the naming convention -- no table name is
+    // stored anywhere; it's derived on every call.
+    tableName = "tbl" & systemName,
+    Source = Excel.CurrentWorkbook(){[Name=tableName]}[Content],
+
+    // Excludes fields explicitly marked as not applicable to this source before renaming,
+    // so the intent is explicit rather than relying solely on MissingField.Ignore to
+    // paper over a genuine configuration gap.
+    Applicable = Table.SelectRows(tblFieldMapping, each Record.Field(_, systemName) <> "N/A - Not in Source"),
+
+    // Record.Field(_, systemName) is required rather than a direct field reference (e.g.
+    // [SystemA]) because the column to read is determined by the systemName parameter at
+    // runtime, not fixed at the time this code was written.
+    RenamePairs = Table.ToRows(Table.SelectColumns(Applicable, {systemName, "Canonical_Field"})),
+    Renamed = Table.RenameColumns(Source, RenamePairs, MissingField.Ignore),
+
+    // Date fields are identified via Field Mapping's Data_Type column, intersected with
+    // columns that actually survived the rename above -- this avoids an error if a date
+    // field happens to be marked not-applicable for this particular source.
+    DateFieldCandidates = Table.SelectRows(tblFieldMapping, each [Data_Type] = "Date")[Canonical_Field],
+    ExistingDateFields = List.Intersect({Table.ColumnNames(Renamed), DateFieldCandidates}),
+    Typed = Table.TransformColumnTypes(Renamed, List.Transform(ExistingDateFields, each {_, type date})),
+
+    // Tags every row with its originating system -- the single point where this label is
+    // written into the data itself (surfaced later as Canonical!Source_System).
+    AddSystem = Table.AddColumn(Typed, "Source_System", each systemName)
+in
+    AddSystem
