@@ -11,38 +11,41 @@ let
 
     // Translates raw values to canonical values for whichever fields Field Mapping's
     // Value_Mapping_Table column designates (most fields require no translation and are
-    // skipped). Each field keeps the same name before and after translation -- e.g. the
-    // field is always "Status", never "Status_Raw" beforehand -- which requires producing
-    // the translated value under a temporary name, removing the untranslated original, and
-    // renaming the temporary column back, since Power Query does not allow two columns
-    // with the same name to coexist mid-query. The mapping table itself is resolved by
-    // name at runtime via Excel.CurrentWorkbook, making the translation step fully
-    // data-driven rather than requiring one hardcoded merge per field.
+    // skipped). Each field keeps the same name after translation as it had before (e.g.
+    // "Status" throughout), while the untranslated value is preserved permanently under
+    // "<Field>_Raw" (e.g. "Status_Raw") rather than discarded -- so a mapping issue can be
+    // investigated directly from Canonical without needing a separate staging table. This
+    // requires: producing the translated value under a temporary name, renaming the
+    // untranslated original out of the way to "<Field>_Raw", then moving the translated
+    // value into the now-free original name -- since Power Query does not allow two
+    // columns with the same name to coexist mid-query. The mapping table itself is
+    // resolved by name at runtime via Excel.CurrentWorkbook, making the translation step
+    // fully data-driven rather than requiring one hardcoded merge per field.
     //
     // HARDCODED: "Value_Mapping_Table" as Field Mapping's own column name; "Source_System"
     // and "Raw_Value" as the join-key column names every Mapping_Values table must use;
     // "Canonical_Value" as the translated-value column name every Mapping_Values table
     // must use; the "_Translated" temporary-name suffix (only visible mid-query, never in
-    // the final output).
+    // the final output) and the "_Raw" suffix (permanent, appears in the final output).
     FieldsNeedingTranslation = Table.SelectRows(tblFieldMapping, each [Value_Mapping_Table] <> null and [Value_Mapping_Table] <> ""),
     ValueMapped = List.Accumulate(
         Table.ToRecords(FieldsNeedingTranslation),
         Reordered,
         (state, cfg) =>
             let
-                fieldName = cfg[Canonical_Field],
-                tempName  = fieldName & "_Translated",
-                mapTable  = Excel.CurrentWorkbook(){[Name=cfg[Value_Mapping_Table]]}[Content],
-                joined    = Table.NestedJoin(state, {"Source_System", fieldName}, mapTable,
-                                {"Source_System", "Raw_Value"}, "JoinTemp", JoinKind.LeftOuter),
-                expanded  = Table.ExpandTableColumn(joined, "JoinTemp", {"Canonical_Value"}, {tempName}),
-                dropped   = Table.RemoveColumns(expanded, {fieldName}),
-                renamed   = Table.RenameColumns(dropped, {{tempName, fieldName}})
+                fieldName      = cfg[Canonical_Field],
+                translatedTemp = fieldName & "_Translated",
+                mapTable       = Excel.CurrentWorkbook(){[Name=cfg[Value_Mapping_Table]]}[Content],
+                joined         = Table.NestedJoin(state, {"Source_System", fieldName}, mapTable,
+                                     {"Source_System", "Raw_Value"}, "JoinTemp", JoinKind.LeftOuter),
+                expanded       = Table.ExpandTableColumn(joined, "JoinTemp", {"Canonical_Value"}, {translatedTemp}),
+                renamedRaw     = Table.RenameColumns(expanded, {{fieldName, fieldName & "_Raw"}}),
+                renamedFinal   = Table.RenameColumns(renamedRaw, {{translatedTemp, fieldName}})
             in
-                renamed
+                renamedFinal
     ),
 
-    // Risk_ID is a composite key (Source_System + Source_ID), not a copy of Source_ID.
+    // Item_ID is a composite key (Source_System + Source_ID), not a copy of Source_ID.
     // Source_ID alone is only guaranteed unique WITHIN one source system, not across all
     // of them -- if two source systems ever produced the same raw ID under a different
     // convention, Source_ID collisions would corrupt the Review_Log lookup below, silently
@@ -50,9 +53,9 @@ let
     // that dependency on every source's ID convention staying distinct forever.
     //
     // HARDCODED: "-" as the separator between Source_System and Source_ID. Changing this
-    // format would invalidate every existing Risk_ID already recorded in Review_Log --
+    // format would invalidate every existing Item_ID already recorded in Review_Log --
     // avoid changing it once any review history exists.
-    AddRiskID = Table.AddColumn(ValueMapped, "Risk_ID", each [Source_System] & "-" & [Source_ID]),
+    AddItemID = Table.AddColumn(ValueMapped, "Item_ID", each [Source_System] & "-" & [Source_ID]),
 
     // The formulas below define specific business rules (what "overdue" means, what counts
     // as a "potential duplicate") rather than performing a generic transformation, so field
@@ -63,7 +66,7 @@ let
     // HARDCODED: "Closed" as the Status value meaning an item is no longer active (used
     // throughout this query, not just here); "Due_Date" as the field driving the overdue
     // calculation.
-    AddDaysOverdue = Table.AddColumn(AddRiskID, "Days_Overdue", each
+    AddDaysOverdue = Table.AddColumn(AddItemID, "Days_Overdue", each
         if [Status] = "Closed" or [Due_Date] = null then 0
         else List.Max({0, Duration.Days(DateTime.LocalNow() - [Due_Date])})),
     AddIsOverdue = Table.AddColumn(AddDaysOverdue, "Is_Overdue", each if [Days_Overdue] > 0 then "Yes" else "No"),
@@ -141,26 +144,33 @@ let
     DropIntermediate = Table.RemoveColumns(FixScopeForClosed, {"ClusterSize", "Suggested_Scope_Level"}),
     RenameScope = Table.RenameColumns(DropIntermediate, {{"Suggested_Scope_Level_Final", "Suggested_Scope_Level"}}),
 
-    // Brings in manually recorded review decisions, keyed by Risk_ID. Review_Log is kept
+    // Brings in manually recorded review decisions, keyed by Item_ID. Review_Log is kept
     // as a separate table specifically because a refresh rebuilds this query's output from
     // scratch; any value entered directly into this query's result would be lost on the
     // next refresh.
     //
-    // HARDCODED: "Risk_ID" as the join key -- must exist, spelled exactly this way, as a
+    // HARDCODED: "Item_ID" as the join key -- must exist, spelled exactly this way, as a
     // column on the Review_Log sheet; "Review_Status" and "Reviewed_Scope_Level" as the
     // two Review_Log column names actually pulled into Canonical (Review_Log's other
     // columns -- Description, Reviewed_By, Review_Date, Notes -- stay in Review_Log only
     // and are not referenced here).
-    MergeReview = Table.NestedJoin(RenameScope, {"Risk_ID"}, tblReviewLog, {"Risk_ID"}, "ReviewJoin", JoinKind.LeftOuter),
+    MergeReview = Table.NestedJoin(RenameScope, {"Item_ID"}, tblReviewLog, {"Item_ID"}, "ReviewJoin", JoinKind.LeftOuter),
     ExpandReview = Table.ExpandTableColumn(MergeReview, "ReviewJoin",
         {"Review_Status", "Reviewed_Scope_Level"}, {"Review_Status", "Reviewed_Scope_Level"}),
 
     // Defines the final output schema. The 12 raw/passthrough fields are read directly from
     // Field Mapping -- adding a canonical field there now flows through to the output
-    // automatically, with no risk of it being silently dropped at this step.
+    // automatically, with no risk of it being silently dropped at this step. Each
+    // translated field's raw counterpart (e.g. Status_Raw) is placed immediately after it,
+    // rather than grouped separately, since the raw value is most useful sitting next to
+    // its translated counterpart when investigating a mapping issue. Which fields get a
+    // _Raw counterpart is read from FieldsNeedingTranslation (computed above) rather than
+    // hardcoded, so this stays correct if a field is added to or removed from value
+    // translation later.
     //
-    // HARDCODED: "Risk_ID" and "Source_System" (computed above, not present in Field
-    // Mapping); the eight computed-field names below (Days_Overdue, Is_Overdue, Signature,
+    // HARDCODED: "Item_ID" and "Source_System" (computed above, not present in Field
+    // Mapping); the "_Raw" suffix (must match the suffix used in ValueMapped above); the
+    // eight computed-field names at the end (Days_Overdue, Is_Overdue, Signature,
     // Region_Bucket, Is_Potential_Duplicate, Suggested_Scope_Level, Review_Status,
     // Reviewed_Scope_Level) -- none of these exist in Field Mapping, so they cannot be
     // derived and must be listed explicitly. Adding a new field that is itself computed
@@ -168,11 +178,18 @@ let
     // name to this list -- Table.SelectColumns raises an immediate, clear error if any
     // name in this list does not exist at this point, which is the safeguard for typos
     // in this list or an upstream step silently failing to produce an expected column.
+    FieldOrderWithRaw = List.Combine(
+        List.Transform(tblFieldMapping[Canonical_Field], each
+            if List.Contains(FieldsNeedingTranslation[Canonical_Field], _)
+            then {_, _ & "_Raw"}
+            else {_}
+        )
+    ),
     FinalOrder = Table.SelectColumns(
         ExpandReview,
         List.Combine({
-            {"Risk_ID", "Source_System"},
-            tblFieldMapping[Canonical_Field],
+            {"Item_ID", "Source_System"},
+            FieldOrderWithRaw,
             {"Days_Overdue", "Is_Overdue", "Signature", "Region_Bucket",
              "Is_Potential_Duplicate", "Suggested_Scope_Level", "Review_Status", "Reviewed_Scope_Level"}
         })
