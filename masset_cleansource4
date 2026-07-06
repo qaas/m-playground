@@ -1,0 +1,60 @@
+// ============================================================================
+// fnCleanSource
+// ----------------------------------------------------------------------------
+// Cleans and normalizes an already-fetched raw table: renames columns to their canonical
+// names, applies date typing, and tags each row with its source system. Shared by every
+// source-specific query so the transformation logic exists once, independent of how many
+// sources are combined.
+//
+// DESIGN NOTE: this function never accesses a data source itself (no call to
+// Excel.CurrentWorkbook or any other data-source function). Fetching the raw table is the
+// responsibility of the calling query, which supplies it as the rawTable parameter. This
+// keeps the function limited to pure data transformation, with no dependency on how or
+// where a source's raw table happens to be stored, and avoids combining a data-source
+// access with a parameterized argument inside a single function -- a pattern Power Query's
+// Formula Firewall disallows, since it cannot statically verify a dynamically-resolved
+// data source ahead of evaluation. Keeping data access and data transformation in separate
+// functions is a reliable way to sidestep that restriction entirely, rather than needing a
+// workaround for it.
+//
+// Parameters:
+//   rawTable   -- the source's raw data, already fetched by the caller
+//   systemName -- a label identifying the source system (e.g. "SystemA"), matching a
+//                 column header in fieldMap
+//   fieldMap   -- the field-mapping configuration table, defining the canonical field name
+//                 corresponding to each raw column, per source system
+//
+// HARDCODED IN THIS FUNCTION (update here if these conventions change):
+//   - "N/A - Not in Source" as the marker meaning a field does not apply to a given source
+//     (Applicable step) -- must match the marker used in the field-mapping table exactly
+//   - "Canonical_Field" and "Data_Type" as the field-mapping table's own column names
+//     (RenamePairs, DateFieldCandidates steps)
+//   - "Date" as the Data_Type value that triggers date typing (DateFieldCandidates step)
+//   - "Source_System" as the name of the column recording which source a row came from
+//     (AddSystem step) -- referenced again throughout the combining query
+// ============================================================================
+(rawTable as table, systemName as text, fieldMap as table) as table =>
+let
+    // Excludes fields explicitly marked as not applicable to this source before renaming,
+    // making the exclusion explicit rather than relying solely on MissingField.Ignore to
+    // silently absorb a genuine configuration gap.
+    Applicable = Table.SelectRows(fieldMap, each Record.Field(_, systemName) <> "N/A - Not in Source"),
+
+    // Record.Field(_, systemName) is used rather than a direct field reference (e.g.
+    // [SystemA]) because the column to read is determined by the systemName parameter at
+    // runtime, not fixed when this code is written.
+    RenamePairs = Table.ToRows(Table.SelectColumns(Applicable, {systemName, "Canonical_Field"})),
+    Renamed = Table.RenameColumns(rawTable, RenamePairs, MissingField.Ignore),
+
+    // Date fields are identified via the field-mapping table's Data_Type column,
+    // intersected with columns that actually survived the rename above, so this does not
+    // error if a date field is marked not-applicable for a particular source.
+    DateFieldCandidates = Table.SelectRows(fieldMap, each [Data_Type] = "Date")[Canonical_Field],
+    ExistingDateFields = List.Intersect({Table.ColumnNames(Renamed), DateFieldCandidates}),
+    Typed = Table.TransformColumnTypes(Renamed, List.Transform(ExistingDateFields, each {_, type date})),
+
+    // Tags every row with its originating system -- the single point where this label is
+    // written into the data itself.
+    AddSystem = Table.AddColumn(Typed, "Source_System", each systemName)
+in
+    AddSystem
