@@ -1,0 +1,12 @@
+// Product Category is a computed field derived by looking up Product in
+// tblProductCategoryMap -- a grouping of products, not a translation of the same
+// concept, so it is a separate field rather than a "Product Raw"/"Product" pair.
+//
+// HARDCODED: "Product" as the field looked up; "Source_System" and "Raw_Value" as the
+// mapping table's own join-key columns; "Canonical_Value" as its translated-value column.
+MergeProductCategory = Table.NestedJoin(AddScope, {"Source System", "Product"}, tblProductCategoryMap,
+    {"Source_System", "Raw_Value"}, "ProductCategoryJoin", JoinKind.LeftOuter),
+ExpandProductCategory = Table.ExpandTableColumn(MergeProductCategory, "ProductCategoryJoin", {"Canonical_Value"}, {"Product Category Raw"}),
+AddProductCategory = Table.AddColumn(ExpandProductCategory, "Product Category", each
+    if [#"Product Category Raw"] <> null then [#"Product Category Raw"] else "Unmapped:" & [Product]),
+DropProductCategoryRaw = Table.RemoveColumns(AddProductCategory, {"Product Category Raw"}),
